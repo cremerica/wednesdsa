@@ -1,0 +1,21 @@
+openapi: 3.0.1
+info:
+  title: wednesdsa
+  description: Repository for Flask Application. Created Automatically!!
+  x-cortex-tag: wednesdsa
+  x-cortex-git:
+    github:
+      repository: cremerica/wednesdsa
+  x-cortex-owners:
+  - channel: ""
+    type: SLACK
+  - email: ""
+    type: EMAIL
+  - name: ""
+    provider: CORTEX
+    type: GROUP
+  x-cortex-service-groups:
+  - flask
+  x-cortex-custom-metadata:
+    cortex-template-version: 0.2
+    cortex-generated-timestamp: 2025-09-03T13:53:11.963025607

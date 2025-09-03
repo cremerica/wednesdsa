@@ -1,0 +1,121 @@
+---
+# Source: cortex-k8s-agent/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cortex-service-account
+  namespace: default
+  labels:
+    helm.sh/chart: cortex-k8s-agent-0.1.0
+    app.kubernetes.io/name: cortex-k8s-agent
+    app.kubernetes.io/instance: cortex-agent
+    app.kubernetes.io/version: "1.16.0"
+    app.kubernetes.io/managed-by: Helm
+---
+# Source: cortex-k8s-agent/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cortex-k8s-agent-configmap
+data:
+  SPRING_PROFILES_ACTIVE: prod
+  BASE_URL: https://api.getcortexapp.com
+  CORTEX_CLUSTER: wednesdsa
+---
+# Source: cortex-k8s-agent/templates/clusterrole.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cortex-service-account
+rules:
+  - apiGroups: ["apps", "argoproj.io", "batch"]
+    resources: ["deployments", "services", "pods", "replicationcontrollers", "statefulsets", "rollouts", "cronjobs"]
+    verbs: ["get", "watch", "list"]
+---
+# Source: cortex-k8s-agent/templates/cluterrolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cortex-service-account
+subjects:
+  - kind: ServiceAccount
+    name: cortex-service-account
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: cortex-service-account
+  apiGroup: rbac.authorization.k8s.io
+---
+# Source: cortex-k8s-agent/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: cortex-k8s-agent
+  labels:
+    helm.sh/chart: cortex-k8s-agent-0.1.0
+    app.kubernetes.io/name: cortex-k8s-agent
+    app.kubernetes.io/instance: cortex-agent
+    app.kubernetes.io/version: "1.16.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: http-api
+      protocol: TCP
+      name: http-cortex-k8s-agent
+  selector:
+    app.kubernetes.io/name: cortex-k8s-agent
+    app.kubernetes.io/instance: cortex-agent
+---
+# Source: cortex-k8s-agent/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cortex-k8s-agent
+  labels:
+    helm.sh/chart: cortex-k8s-agent-0.1.0
+    app.kubernetes.io/name: cortex-k8s-agent
+    app.kubernetes.io/instance: cortex-agent
+    app.kubernetes.io/version: "1.16.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cortex-k8s-agent
+      app.kubernetes.io/instance: cortex-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cortex-k8s-agent
+        app.kubernetes.io/instance: cortex-agent
+    spec:
+      imagePullSecrets:
+        - name: cortex-docker-registry-secret
+      serviceAccountName: cortex-service-account
+      containers:
+        - name: cortex-k8s-agent
+          image: "ghcr.io/cortexapps/k8s-agent/k8s-agent:ad9bf8eab547c71d7d90dbff06d3433d9088f332"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http-api
+              containerPort: 80
+              protocol: TCP
+          readinessProbe:
+            initialDelaySeconds: 30
+            periodSeconds: 5
+            httpGet:
+              path: /actuator/health
+              port: 8080
+          resources:
+            {}
+          env:
+            - name: CORTEX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cortex-key
+                  key: api-key
+          envFrom:
+            - configMapRef:
+                name: cortex-k8s-agent-configmap

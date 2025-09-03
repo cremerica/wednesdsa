@@ -1,0 +1,411 @@
+name: Deploy to GKE
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'GKE cluster name'
+        required: true
+        default: 'wednesdsa'
+      zone:
+        description: 'GCP zone'
+        required: true
+        default: 'us-central1-a'
+      node_count:
+        description: 'Number of nodes'
+        required: true
+        default: '3'
+      machine_type:
+        description: 'Machine type for nodes'
+        required: true
+        default: 'e2-medium'
+      cortex_url:
+        description: 'Callback URL'
+        required: true
+        default: 'http://api.cortex.com'  
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+jobs:
+  deploy-to-gke:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Install kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+
+    - name: Install GKE gcloud auth plugin
+      run: |
+        echo "Installing gke-gcloud-auth-plugin..."
+        gcloud components install gke-gcloud-auth-plugin --quiet
+        
+        # Set environment variable for the plugin
+        echo "USE_GKE_GCLOUD_AUTH_PLUGIN=True" >> $GITHUB_ENV
+
+    - name: Verify installations
+      run: |
+        echo "Checking installations..."
+        kubectl version --client
+        gcloud version
+        echo "GKE auth plugin location:"
+        which gke-gcloud-auth-plugin || echo "Plugin not in PATH, but should be available via gcloud"
+
+    - name: Create Artifact Registry repository
+      run: |
+        echo "🏗️ Creating Artifact Registry repository..."
+        REPO_NAME="${{ github.event.inputs.cluster_name }}-repo"
+        REGION="${{ github.event.inputs.zone }}"
+        # Extract region from zone (e.g., us-central1-a -> us-central1)
+        REGION=$(echo "$REGION" | sed 's/-[a-z]$//')
+        
+        # Check if repository already exists
+        if gcloud artifacts repositories describe "$REPO_NAME" --location="$REGION" >/dev/null 2>&1; then
+          echo "✅ Repository $REPO_NAME already exists in $REGION"
+        else
+          echo "Creating new repository: $REPO_NAME in $REGION"
+          gcloud artifacts repositories create "$REPO_NAME" \
+            --repository-format=docker \
+            --location="$REGION" \
+            --description="Docker repository for ${{ github.event.inputs.cluster_name }}"
+          echo "✅ Repository created successfully"
+        fi
+        
+        # Set repository URL for later steps
+        REPO_URL="$REGION-docker.pkg.dev/${{ env.PROJECT_ID }}/$REPO_NAME"
+        echo "ARTIFACT_REGISTRY_REPO=$REPO_URL" >> $GITHUB_ENV
+        echo "REGION=$REGION" >> $GITHUB_ENV
+
+    - name: Configure Docker for Artifact Registry
+      run: |
+        echo "🔐 Configuring Docker authentication for Artifact Registry..."
+        gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+    - name: Build and tag Docker image
+      run: |
+        echo "🐳 Building Docker image..."
+        IMAGE_NAME="${{ github.event.inputs.cluster_name }}"
+        IMAGE_TAG="latest"
+        FULL_IMAGE_NAME="${{ env.ARTIFACT_REGISTRY_REPO }}/$IMAGE_NAME:$IMAGE_TAG"
+        
+        echo "Building image: $FULL_IMAGE_NAME"
+        docker build -t "$FULL_IMAGE_NAME" .
+        
+        # Also tag with commit SHA for versioning
+        COMMIT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+        FULL_IMAGE_NAME_SHA="${{ env.ARTIFACT_REGISTRY_REPO }}/$IMAGE_NAME:$COMMIT_SHA"
+        docker tag "$FULL_IMAGE_NAME" "$FULL_IMAGE_NAME_SHA"
+        
+        echo "✅ Image built and tagged:"
+        echo "  - $FULL_IMAGE_NAME"
+        echo "  - $FULL_IMAGE_NAME_SHA"
+
+        curl -L \
+          --request POST \
+          --max-time 30 \
+          --retry 2 \
+          --url "${{ github.event.inputs.cortex_url }}" \
+          --header "Authorization: Bearer ${{ secrets.CORTEX_TOKEN }}" \
+          --header "Content-Type: application/json" \
+          --data '{"status":"update", "message":"Built Image and Tagged!"}'
+        
+        # Set environment variables for later steps
+        echo "DOCKER_IMAGE_URL=$FULL_IMAGE_NAME" >> $GITHUB_ENV
+        echo "DOCKER_IMAGE_URL_SHA=$FULL_IMAGE_NAME_SHA" >> $GITHUB_ENV
+        
+        # Show image details
+        docker images | grep "$IMAGE_NAME" || true
+
+    - name: Push Docker image to Artifact Registry
+      run: |
+        echo "📤 Pushing Docker image to Artifact Registry..."
+        echo "Pushing: ${{ env.DOCKER_IMAGE_URL }}"
+        docker push "${{ env.DOCKER_IMAGE_URL }}"
+        
+        echo "Pushing: ${{ env.DOCKER_IMAGE_URL_SHA }}"
+        docker push "${{ env.DOCKER_IMAGE_URL_SHA }}"
+        
+        echo "✅ Images pushed successfully to Artifact Registry"
+        
+        # Verify the push
+        echo "Verifying images in registry:"
+        gcloud artifacts docker images list ${{ env.ARTIFACT_REGISTRY_REPO }}/${{github.event.inputs.cluster_name }} --include-tags
+
+    
+    - name: Get access token
+      id: get-token
+      run: |
+        ACCESS_TOKEN=$(gcloud auth print-access-token)
+        echo "::add-mask::$ACCESS_TOKEN"
+        echo "token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+
+    - name: Create GKE Cluster
+      id: create-cluster
+      run: |
+        echo "🚀 Creating GKE cluster: ${{ github.event.inputs.cluster_name }}"
+        
+        RESPONSE=$(curl -s -w "HTTPSTATUS:%{http_code}" -X POST \
+          "https://container.googleapis.com/v1/projects/${{ env.PROJECT_ID }}/zones/${{ github.event.inputs.zone }}/clusters" \
+          -H "Authorization: Bearer ${{ steps.get-token.outputs.token }}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "cluster": {
+              "name": "${{ github.event.inputs.cluster_name }}",
+              "initialNodeCount": ${{ github.event.inputs.node_count }},
+              "nodeConfig": {
+                "machineType": "${{ github.event.inputs.machine_type }}",
+                "diskSizeGb": 100,
+                "oauthScopes": [
+                  "https://www.googleapis.com/auth/cloud-platform"
+                ],
+                "imageType": "COS_CONTAINERD"
+              },
+              "masterAuth": {
+                "clientCertificateConfig": {
+                  "issueClientCertificate": false
+                }
+              },
+              "ipAllocationPolicy": {
+                "useIpAliases": true
+              },
+              "loggingService": "logging.googleapis.com/kubernetes",
+              "monitoringService": "monitoring.googleapis.com/kubernetes",
+              "locations": ["${{ github.event.inputs.zone }}"]
+            }
+          }')
+        
+        # Extract HTTP status and body
+        HTTP_STATUS=$(echo $RESPONSE | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
+        BODY=$(echo $RESPONSE | sed -e 's/HTTPSTATUS\:.*//g')
+        
+        echo "HTTP Status: $HTTP_STATUS"
+        echo "Response Body:"
+        echo "$BODY" | jq '.' || echo "$BODY"
+        
+        if [ $HTTP_STATUS -ne 200 ]; then
+          echo "❌ Failed to create cluster (HTTP $HTTP_STATUS)"
+          exit 1
+        fi
+        
+        # Check for API errors
+        if echo "$BODY" | jq -e '.error' > /dev/null; then
+          echo "❌ API Error:"
+          echo "$BODY" | jq '.error'
+          exit 1
+        fi
+        
+        # Extract operation name
+        OPERATION_NAME=$(echo "$BODY" | jq -r '.name // empty')
+        
+        if [ -z "$OPERATION_NAME" ] || [ "$OPERATION_NAME" == "null" ]; then
+          echo "❌ Failed to get operation name"
+          exit 1
+        fi
+        
+        echo "✅ Cluster creation started. Operation: $OPERATION_NAME"
+        echo "operation_name=$OPERATION_NAME" >> $GITHUB_OUTPUT
+
+    - name: Wait for cluster creation
+      run: |
+        curl -L \
+          --request POST \
+          --max-time 30 \
+          --retry 2 \
+          --url "${{ github.event.inputs.cortex_url }}" \
+          --header "Authorization: Bearer ${{ secrets.CORTEX_TOKEN }}" \
+          --header "Content-Type: application/json" \
+          --data '{"status":"update", "message":"About to Build the cluster, this will take several minutes. We will slack you when complete."}'
+        echo "⏳ Waiting for cluster creation to complete..."
+        OPERATION_NAME="${{ steps.create-cluster.outputs.operation_name }}"
+        TIMEOUT=1800  # 30 minutes timeout
+        ELAPSED=0
+        
+        while [ $ELAPSED -lt $TIMEOUT ]; do
+          # Get fresh token (they expire)
+          ACCESS_TOKEN=$(gcloud auth print-access-token)
+          
+          STATUS_RESPONSE=$(curl -s -X GET \
+            "https://container.googleapis.com/v1/projects/${{ env.PROJECT_ID }}/zones/${{ github.event.inputs.zone }}/operations/$OPERATION_NAME" \
+            -H "Authorization: Bearer $ACCESS_TOKEN")
+          
+          STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status // "UNKNOWN"')
+          echo "Current status: $STATUS (elapsed: ${ELAPSED}s)"
+          
+          if [ "$STATUS" == "DONE" ]; then
+            echo "✅ Cluster creation completed!"
+            
+            # Check if there were any errors
+            if echo "$STATUS_RESPONSE" | jq -e '.error' > /dev/null; then
+              echo "❌ Cluster creation completed with errors:"
+              echo "$STATUS_RESPONSE" | jq '.error'
+              exit 1
+            fi
+            
+            break
+          elif [ "$STATUS" == "ABORTED" ] || [ "$STATUS" == "CANCELLED" ]; then
+            echo "❌ Cluster creation failed with status: $STATUS"
+            echo "$STATUS_RESPONSE" | jq '.'
+            exit 1
+          fi
+          
+          echo "Still creating... waiting 30 seconds"
+          sleep 30
+          ELAPSED=$((ELAPSED + 30))
+        done
+        
+        if [ $ELAPSED -ge $TIMEOUT ]; then
+          echo "❌ Timeout waiting for cluster creation"
+          exit 1
+        fi
+
+    - name: Configure kubectl
+      run: |
+        echo "⚙️ Configuring kubectl..."
+        gcloud container clusters get-credentials "${{ github.event.inputs.cluster_name }}" \
+          --zone "${{ github.event.inputs.zone }}" \
+          --project "${{ env.PROJECT_ID }}"
+        echo "✅ kubectl configured for cluster: ${{ github.event.inputs.cluster_name }}"  
+
+    - name: Verify cluster
+      run: |
+        echo "🔍 Verifying cluster..."
+        kubectl cluster-info
+        echo ""
+        echo "Cluster nodes:"
+        kubectl get nodes
+        echo ""
+        kubectl get namespaces
+
+    - name: Deploy Cortex Agent
+      run: |
+        echo "🚀 Deploying Cortex Agentl..."
+        kubectl create secret generic cortex-key --from-literal api-key=${{ secrets.CORTEX_TOKEN }}
+        kubectl create secret docker-registry cortex-docker-registry-secret --docker-server=ghcr.io --docker-username=cortex-image-bot --docker-password=${{ secrets.IMAGE_PULL }} --docker-email=bot@cortex.io
+        kubectl apply -f infra/cortex/agent.yaml
+        
+        
+    - name: Apply Kubernetes deployment
+      run: |
+        echo "🚀 Applying deployment from yaml/deployment.yaml..."
+        kubectl apply -f yaml/deployment.yaml
+        
+        echo ""
+        echo "⏳ Waiting for deployments to be ready (timeout: 300s)..."
+        kubectl wait --for=condition=available --timeout=300s deployment --all || {
+          echo "⚠️ Some deployments may still be starting. Current status:"
+          kubectl get deployments
+          echo ""
+          kubectl get pods
+        }
+
+    - name: Show deployment status
+      run: |
+        echo ""
+        echo "📊 Final deployment status:"
+        echo ""
+        echo "Deployments:"
+        kubectl get deployments -o wide
+        echo ""
+        echo "Pods:"
+        kubectl get pods -o wide
+        echo ""
+        echo "Services:"
+        kubectl get services -o wide
+        echo ""
+        echo "Events (last 10):"
+        kubectl get events --sort-by=.metadata.creationTimestamp --field-selector type!=Normal | tail -10 || true
+        curl -L \
+          --request POST \
+          --max-time 30 \
+          --retry 2 \
+          --url "https://api.getcortexapp.com/api/v1/catalog/${{ github.event.inputs.cluster_name }}/deploys" \
+          --header "Authorization: Bearer ${{ secrets.CORTEX_TOKEN }}" \
+          --header "Content-Type: application/json" \
+          --data "{
+            \"environment\": \"Production\",
+            \"sha\": \"${{ github.sha }}\",
+            \"timestamp\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",
+            \"title\": \"Initial Deployment\",
+            \"type\": \"DEPLOY\"
+           }"
+
+    - name: Get service endpoints
+      run: |
+        echo ""
+        echo "🌐 Service endpoints:"
+        echo ""
+        # Wait a bit for LoadBalancer to get external IP
+        echo "Waiting 60 seconds for LoadBalancer services to get external IPs..."
+        sleep 60
+        
+        kubectl get services -o wide
+        echo ""
+        
+        # Show any LoadBalancer services with external IPs
+        EXTERNAL_IPS=$(kubectl get services --field-selector spec.type=LoadBalancer -o jsonpath='{.items[*].status.loadBalancer.ingress[*].ip}')
+        if [ -n "$EXTERNAL_IPS" ]; then
+          echo "🎉 External IPs available:"
+          echo "$EXTERNAL_IPS"
+        else
+          echo "⏳ External IPs still pending. Check again in a few minutes with:"
+          echo "kubectl get services"
+        fi
+        curl -L \
+          --request POST \
+          --max-time 30 \
+          --retry 2 \
+          --url "${{ github.event.inputs.cortex_url }}" \
+          --header "Authorization: Bearer ${{ secrets.CORTEX_TOKEN }}" \
+          --header "Content-Type: application/json" \
+          --data '{"status":"update", "message":"Application available at http://$EXTERNAL_IPS"}'
+
+    - name: Cleanup instructions
+      run: |
+        echo ""
+        echo "🧹 To clean up this cluster later, run:"
+        echo "gcloud container clusters delete ${{ github.event.inputs.cluster_name }} --zone ${{ github.event.inputs.zone }} --quiet"
+        echo ""
+        echo "Or delete via curl:"
+        echo 'curl -X DELETE \'
+        echo "  \"https://container.googleapis.com/v1/projects/${{ env.PROJECT_ID }}/zones/${{ github.event.inputs.zone }}/clusters/${{ github.event.inputs.cluster_name }}\" \\"
+        echo '  -H "Authorization: Bearer $(gcloud auth print-access-token)"'
+
+  notify-result:
+    runs-on: ubuntu-latest
+    needs: deploy-to-gke
+    if: always() # This ensures the job runs regardless of build-and-deploy outcome
+    
+    steps:
+    - name: Send notification to Cortex
+      run: |
+        
+        curl -L \
+          --request POST \
+          --max-time 30 \
+          --retry 2 \
+          --url "${{ github.event.inputs.cortex_url }}" \
+          --header "Authorization: Bearer ${{ secrets.CORTEX_TOKEN }}" \
+          --header "Content-Type: application/json" \
+          --data '{"status":"update", "message":"Deployed the Cluster","response":{"data":"randomvalue"}}'
+
+          curl -L \
+          --request POST \
+          --max-time 30 \
+          --retry 2 \
+          --url "${{ github.event.inputs.cortex_url }}" \
+          --header "Authorization: Bearer ${{ secrets.CORTEX_TOKEN }}" \
+          --header "Content-Type: application/json" \
+          --data '{"status":"Success", "message":"Deployed the Cluster","response":{"data":"randomvalue"}}'      
